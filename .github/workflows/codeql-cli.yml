@@ -1,0 +1,182 @@
+name: CodeQL CLI analysis
+
+on:
+  workflow_call:
+    inputs:
+      detection-mode:
+        description: "'automatic' or 'computed'; computed requires a pull request."
+        type: string
+        default: automatic
+      codeql-version:
+        description: "CodeQL bundle release tag, such as codeql-bundle-v2.27.4, or latest."
+        type: string
+        default: latest
+      config-file:
+        description: Optional CodeQL configuration file relative to the caller's repository root.
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+
+jobs:
+  detect:
+    uses: ./.github/workflows/codeql-language-detection.yml
+    with:
+      mode: ${{ inputs.detection-mode }}
+
+  analyze:
+    name: CodeQL / ${{ matrix.language }}
+    needs: detect
+    if: ${{ needs.detect.outputs.has-languages == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.detect.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out the analyzed commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install CodeQL CLI and bundled queries
+        env:
+          CODEQL_VERSION: ${{ inputs.codeql-version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$CODEQL_VERSION" == latest ]]; then
+            release_url="https://github.com/github/codeql-action/releases/latest/download"
+          elif [[ "$CODEQL_VERSION" =~ ^codeql-bundle-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            release_url="https://github.com/github/codeql-action/releases/download/$CODEQL_VERSION"
+          else
+            echo "::error::codeql-version must be 'latest' or a codeql-bundle-vX.Y.Z release tag."
+            exit 1
+          fi
+          case "$RUNNER_OS" in
+            Linux) asset="codeql-bundle-linux64.tar.gz" ;;
+            macOS) asset="codeql-bundle-osx64.tar.gz" ;;
+            *) echo "::error::Unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+          install_dir="$RUNNER_TEMP/codeql-install"
+          mkdir -p "$install_dir"
+          cd "$install_dir"
+          curl --fail --silent --show-error --location --retry 3 \
+            "$release_url/$asset" --output "$asset"
+          curl --fail --silent --show-error --location --retry 3 \
+            "$release_url/$asset.checksum.txt" --output checksum.txt
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            shasum -a 256 --check checksum.txt
+          else
+            sha256sum --check checksum.txt
+          fi
+          tar -xzf "$asset"
+          echo "$install_dir/codeql" >> "$GITHUB_PATH"
+          "$install_dir/codeql/codeql" version
+
+      - name: Create CodeQL database
+        env:
+          CODEQL_LANGUAGE: ${{ matrix.language }}
+          BUILD_MODE: ${{ matrix.build-mode }}
+          CONFIG_FILE: ${{ inputs.config-file }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          command=(codeql database create "$RUNNER_TEMP/codeql-database")
+          if [[ -n "$CONFIG_FILE" ]]; then
+            config_path="$(python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import sys
+          root = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          relative = Path(os.environ["CONFIG_FILE"])
+          path = (root / relative).resolve(strict=True)
+          if relative.is_absolute() or root not in path.parents or not path.is_file():
+              sys.exit("::error::config-file must identify a file inside the caller's repository.")
+          print(path)
+          PY
+            )"
+            command+=("--codescanning-config=$config_path")
+          fi
+          "${command[@]}" \
+            --language="$CODEQL_LANGUAGE" \
+            --source-root="$GITHUB_WORKSPACE" \
+            --build-mode="$BUILD_MODE" \
+            --threads=0
+
+      - name: Analyze CodeQL database
+        env:
+          CODEQL_LANGUAGE: ${{ matrix.language }}
+          CONFIG_FILE: ${{ inputs.config-file }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          command=(codeql database analyze "$RUNNER_TEMP/codeql-database")
+          if [[ -z "$CONFIG_FILE" ]]; then
+            case "$CODEQL_LANGUAGE" in
+              c-cpp) query_language=cpp ;;
+              java-kotlin) query_language=java ;;
+              javascript-typescript) query_language=javascript ;;
+              *) query_language="$CODEQL_LANGUAGE" ;;
+            esac
+            command+=("codeql/$query_language-queries")
+          fi
+          "${command[@]}" \
+            --format=sarif-latest \
+            --output="$RUNNER_TEMP/codeql-results.sarif" \
+            --sarif-category="codeql-cli/$CODEQL_LANGUAGE" \
+            --threads=0
+
+      - name: Upload code scanning results with the CLI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          if [[ "$commit" != "$GITHUB_SHA" ]]; then
+            echo "::error::The checked-out commit does not match the workflow commit."
+            exit 1
+          fi
+          printf '%s' "$GH_TOKEN" | codeql github upload-results \
+            --repository="$GITHUB_REPOSITORY" \
+            --ref="$GITHUB_REF" \
+            --commit="$commit" \
+            --sarif="$RUNNER_TEMP/codeql-results.sarif" \
+            --github-url="$GITHUB_SERVER_URL" \
+            --github-auth-stdin
+
+  result:
+    name: CodeQL CLI result
+    needs: [detect, analyze]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Report analysis outcome
+        env:
+          DETECTION_RESULT: ${{ needs.detect.result }}
+          ANALYSIS_RESULT: ${{ needs.analyze.result }}
+          HAS_LANGUAGES: ${{ needs.detect.outputs.has-languages }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$DETECTION_RESULT" != success ]]; then
+            echo "::error::Language detection did not succeed."
+            exit 1
+          fi
+          if [[ "$ANALYSIS_RESULT" == success ]]; then
+            echo "CodeQL CLI analysis and SARIF upload succeeded." >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "$ANALYSIS_RESULT" == skipped && "$HAS_LANGUAGES" == false ]]; then
+            echo "No supported languages selected; CodeQL CLI analysis was skipped." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::CodeQL CLI analysis did not succeed: $ANALYSIS_RESULT"
+            exit 1
+          fi
