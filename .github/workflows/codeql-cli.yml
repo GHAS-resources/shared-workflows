@@ -105,8 +105,6 @@ jobs:
             )"
             command+=("--codescanning-config=$config_path")
           fi
-          # Kotlin and Swift use autobuild until CodeQL supports build-mode none.
-          # Go also requires autobuild; interpreted languages and C/C++, C#, Java, Rust use none.
           "${command[@]}" \
             --language="$CODEQL_LANGUAGE" \
             --source-root="$GITHUB_WORKSPACE" \

@@ -96,6 +96,7 @@ jobs:
               for language in sorted(languages):
                   build_mode = "none"
                   # Switch Kotlin and Swift to none when CodeQL adds support.
+                  # Go also currently requires autobuild.
                   if language in {"go", "swift"} or (language == "java-kotlin" and has_kotlin):
                       build_mode = "autobuild"
                   entries.append({

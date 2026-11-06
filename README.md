@@ -95,7 +95,7 @@ An empty matrix skips analysis and reports the skip explicitly. The final
 | Go | `autobuild` | `ubuntu-latest` |
 | Swift | `autobuild` | `macos-15-intel` |
 
-Kotlin and Swift require a build today. Comments in both workflows mark them
+Kotlin and Swift require a build today. A comment beside the language matrix's build-mode selection marks them
 for migration to `none` when supported. Go also currently requires a build.
 Autobuild attempts to discover the build system; projects requiring additional
 SDKs, credentials, custom build steps, or dependencies may fail and need a
