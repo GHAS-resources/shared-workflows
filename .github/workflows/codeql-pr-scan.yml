@@ -1,0 +1,201 @@
+name: Centralized PR CodeQL scan
+run-name: CodeQL ${{ inputs.repository }} PR ${{ inputs.pull_number }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Target repository (owner/name)
+        required: true
+        type: string
+      pull_number:
+        description: Open pull request number
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-pr-${{ inputs.repository }}-${{ inputs.pull_number }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      scan: ${{ steps.prepare.outputs.scan }}
+      matrix: ${{ steps.prepare.outputs.matrix }}
+      sha: ${{ steps.prepare.outputs.sha }}
+      head: ${{ steps.prepare.outputs.head }}
+      base: ${{ steps.prepare.outputs.base }}
+      base_ref: ${{ steps.prepare.outputs.base_ref }}
+      repository: ${{ steps.prepare.outputs.repository }}
+      pull_number: ${{ steps.prepare.outputs.pull_number }}
+      owner: ${{ steps.scope.outputs.owner }}
+      repo: ${{ steps.scope.outputs.repo }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate requested scope
+        id: scope
+        uses: actions/github-script@v8
+        env:
+          TARGET_REPOSITORY: ${{ inputs.repository }}
+          PULL_NUMBER: ${{ inputs.pull_number }}
+          CODEQL_ORG: ${{ vars.CODEQL_ORG || github.repository_owner }}
+        with:
+          script: |
+            const { validateTarget } = require('./.github/scripts/codeql-org-pr.cjs');
+            const target = validateTarget(process.env.TARGET_REPOSITORY, process.env.PULL_NUMBER, process.env.CODEQL_ORG);
+            core.setOutput('owner', target.owner);
+            core.setOutput('repo', target.repo);
+      - name: Create read-only target token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.CODEQL_APP_ID }}
+          private-key: ${{ secrets.CODEQL_APP_PRIVATE_KEY }}
+          owner: ${{ steps.scope.outputs.owner }}
+          repositories: ${{ steps.scope.outputs.repo }}
+          permission-contents: read
+          permission-pull-requests: read
+      - name: Resolve PR snapshot and language matrix
+        id: prepare
+        uses: actions/github-script@v8
+        env:
+          TARGET_REPOSITORY: ${{ inputs.repository }}
+          PULL_NUMBER: ${{ inputs.pull_number }}
+          CODEQL_ORG: ${{ vars.CODEQL_ORG || github.repository_owner }}
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          script: |
+            const { prepare } = require('./.github/scripts/codeql-org-pr.cjs');
+            await prepare({ github, core, repository: process.env.TARGET_REPOSITORY,
+              pullNumber: process.env.PULL_NUMBER, org: process.env.CODEQL_ORG });
+      - name: Check out immutable merge snapshot
+        if: steps.prepare.outputs.scan == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.prepare.outputs.repository }}
+          ref: ${{ steps.prepare.outputs.sha }}
+          token: ${{ steps.app.outputs.token }}
+          path: source
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - name: Package source snapshot
+        if: steps.prepare.outputs.scan == 'true'
+        run: tar -czf "$RUNNER_TEMP/source.tgz" -C source .
+      - name: Store source snapshot for unprivileged scanning
+        if: steps.prepare.outputs.scan == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-source
+          path: ${{ runner.temp }}/source.tgz
+          retention-days: 1
+          if-no-files-found: error
+
+  scan:
+    needs: prepare
+    if: needs.prepare.outputs.scan == 'true'
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      # No App private key or target write token is provided to this job.
+      - uses: actions/download-artifact@v4
+        with:
+          name: codeql-source
+          path: ${{ runner.temp }}/snapshot
+      - name: Restore source snapshot
+        run: |
+          mkdir source
+          tar -xzf "$RUNNER_TEMP/snapshot/source.tgz" -C source
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build_mode }}
+          source-root: source
+          # Do not load configuration or custom queries from the target PR.
+          config: |
+            name: Centralized PR analysis
+            queries:
+              - uses: security-extended
+          dependency-caching: false
+      - name: Autobuild compiled language
+        if: matrix.build_mode == 'autobuild'
+        uses: github/codeql-action/autobuild@v4
+        with:
+          working-directory: source
+      - name: Analyze without uploading to the central repository
+        uses: github/codeql-action/analyze@v4
+        with:
+          checkout_path: source
+          output: ${{ runner.temp }}/sarif
+          category: centralized-pr-codeql/${{ matrix.language }}
+          upload: never
+          upload-database: false
+      - name: Record this runner's source URI
+        run: printf 'file://%s/source/\n' "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/sarif/checkout-uri.txt"
+      - name: Store SARIF for privileged upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-${{ matrix.language }}
+          path: |
+            ${{ runner.temp }}/sarif/*.sarif
+            ${{ runner.temp }}/sarif/checkout-uri.txt
+          retention-days: 1
+          if-no-files-found: error
+
+  upload:
+    needs: [prepare, scan]
+    if: ${{ !cancelled() && needs.prepare.outputs.scan == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download successful language results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sarif-*
+          path: ${{ runner.temp }}/sarif
+      - name: Create target upload token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.CODEQL_APP_ID }}
+          private-key: ${{ secrets.CODEQL_APP_PRIVATE_KEY }}
+          owner: ${{ needs.prepare.outputs.owner }}
+          repositories: ${{ needs.prepare.outputs.repo }}
+          permission-contents: read
+          permission-pull-requests: read
+          permission-security-events: write
+      - name: Upload results to the target PR and await processing
+        uses: actions/github-script@v8
+        env:
+          TARGET_REPOSITORY: ${{ needs.prepare.outputs.repository }}
+          PULL_NUMBER: ${{ needs.prepare.outputs.pull_number }}
+          CODEQL_ORG: ${{ vars.CODEQL_ORG || github.repository_owner }}
+          MERGE_SHA: ${{ needs.prepare.outputs.sha }}
+          HEAD_SHA: ${{ needs.prepare.outputs.head }}
+          BASE_SHA: ${{ needs.prepare.outputs.base }}
+          BASE_REF: ${{ needs.prepare.outputs.base_ref }}
+          LANGUAGE_MATRIX: ${{ needs.prepare.outputs.matrix }}
+          SARIF_DIRECTORY: ${{ runner.temp }}/sarif
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          script: |
+            const { upload } = require('./.github/scripts/codeql-org-pr.cjs');
+            await upload({ github, core, env: process.env });

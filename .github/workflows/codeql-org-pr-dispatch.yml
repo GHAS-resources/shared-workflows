@@ -1,0 +1,54 @@
+name: Dispatch organization PR CodeQL scans
+run-name: Discover open PRs for centralized CodeQL
+
+on:
+  schedule:
+    # Configure the polling interval here. GitHub's minimum is five minutes.
+    # Cron is static: workflow inputs and repository variables cannot set it.
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [codeql-pull-request]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-org-pr-dispatch
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Create organization discovery token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.CODEQL_APP_ID }}
+          private-key: ${{ secrets.CODEQL_APP_PRIVATE_KEY }}
+          owner: ${{ vars.CODEQL_ORG || github.repository_owner }}
+          permission-contents: read
+          permission-pull-requests: read
+      - name: Dispatch open PR scans
+        uses: actions/github-script@v8
+        env:
+          CODEQL_ORG: ${{ vars.CODEQL_ORG || github.repository_owner }}
+          DISPATCH_TOKEN: ${{ github.token }}
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          script: |
+            const { dispatch } = require('./.github/scripts/codeql-org-pr.cjs');
+            // Octokit's auth hook overrides per-request authorization headers.
+            const dispatcher = new github.constructor({
+              auth: process.env.DISPATCH_TOKEN,
+              baseUrl: process.env.GITHUB_API_URL
+            });
+            await dispatch({ github, dispatcher, context, core, org: process.env.CODEQL_ORG });
