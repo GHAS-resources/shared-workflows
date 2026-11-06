@@ -1,0 +1,180 @@
+name: Detect CodeQL languages
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "'automatic' uses repository languages; 'computed' uses PR file extensions."
+        type: string
+        default: automatic
+    outputs:
+      matrix:
+        description: JSON matrix with language, build-mode, and runner entries.
+        value: ${{ jobs.detect.outputs.matrix }}
+      has-languages:
+        description: Whether any supported languages were selected.
+        value: ${{ jobs.detect.outputs.has-languages }}
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.languages.outputs.matrix }}
+      has-languages: ${{ steps.languages.outputs.has-languages }}
+    steps:
+      - name: Select languages
+        id: languages
+        env:
+          DETECTION_MODE: ${{ inputs.mode }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import PurePosixPath
+          from urllib.error import HTTPError
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+
+          API_LANGUAGES = {
+              "C": "c-cpp",
+              "C++": "c-cpp",
+              "C#": "csharp",
+              "Go": "go",
+              "Java": "java-kotlin",
+              "Kotlin": "java-kotlin",
+              "JavaScript": "javascript-typescript",
+              "TypeScript": "javascript-typescript",
+              "Python": "python",
+              "Ruby": "ruby",
+              "Rust": "rust",
+              "Swift": "swift",
+          }
+          EXTENSIONS = {
+              "c-cpp": {".c", ".cc", ".cpp", ".cxx", ".c++", ".h", ".hh", ".hpp", ".hxx", ".h++"},
+              "csharp": {".cs"},
+              "go": {".go"},
+              "java-kotlin": {".java", ".kt", ".kts"},
+              "javascript-typescript": {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"},
+              "python": {".py", ".pyw"},
+              "ruby": {".rb"},
+              "rust": {".rs"},
+              "swift": {".swift"},
+          }
+
+          def api(path, **parameters):
+              url = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/{path}"
+              if parameters:
+                  url += "?" + urlencode(parameters)
+              request = Request(url, headers={
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urlopen(request, timeout=60) as response:
+                  return json.load(response)
+
+          def file_language(filename):
+              path = PurePosixPath(filename)
+              extension = path.suffix.lower()
+              if path.parent == PurePosixPath(".github/workflows") and extension in {".yml", ".yaml"}:
+                  return "actions"
+              if path.name in {"Gemfile", "Rakefile"}:
+                  return "ruby"
+              for language, extensions in EXTENSIONS.items():
+                  if extension in extensions:
+                      return language
+              return None
+
+          def matrix_for(languages, has_kotlin):
+              entries = []
+              for language in sorted(languages):
+                  build_mode = "none"
+                  # Switch Kotlin and Swift to none when CodeQL adds support.
+                  # Go also currently requires autobuild.
+                  if language in {"go", "swift"} or (language == "java-kotlin" and has_kotlin):
+                      build_mode = "autobuild"
+                  entries.append({
+                      "language": language,
+                      "build-mode": build_mode,
+                      "runner": "macos-15-intel" if language == "swift" else "ubuntu-latest",
+                  })
+              return {"include": entries}
+
+          def detect(mode, event):
+              if os.environ["GITHUB_EVENT_NAME"] == "pull_request_target":
+                  raise ValueError("pull_request_target is not supported: do not build PR code with privileged tokens.")
+              if mode not in {"automatic", "computed"}:
+                  raise ValueError("mode must be 'automatic' or 'computed'")
+
+              if mode == "automatic":
+                  repository_languages = api("languages")
+                  languages = {
+                      API_LANGUAGES[name] for name in repository_languages if name in API_LANGUAGES
+                  }
+                  # Linguist reports YAML, not Actions; check the actual workflow directory.
+                  try:
+                      workflows = api("contents/.github/workflows", ref=os.environ["GITHUB_SHA"])
+                  except HTTPError as error:
+                      if error.code != 404:
+                          raise
+                      workflows = []
+                  if isinstance(workflows, list) and any(
+                      item["type"] == "file" and file_language(item["path"]) == "actions"
+                      for item in workflows
+                  ):
+                      languages.add("actions")
+                  return matrix_for(languages, "Kotlin" in repository_languages)
+
+              if "pull_request" not in event:
+                  raise ValueError("computed mode requires a pull_request event; use automatic for other events.")
+              number = event["pull_request"]["number"]
+              pull = api(f"pulls/{number}")
+              if pull["head"]["sha"] != event["pull_request"]["head"]["sha"]:
+                  raise ValueError("The PR changed since this event. Run detection for the latest PR commit.")
+              if pull["changed_files"] > 3000:
+                  raise ValueError("The PR exceeds the API's 3,000-file limit. Use automatic mode.")
+              files = []
+              page = 1
+              while True:
+                  batch = api(f"pulls/{number}/files", per_page=100, page=page)
+                  files.extend(batch)
+                  if len(batch) < 100:
+                      break
+                  page += 1
+              if len(files) != pull["changed_files"]:
+                  raise ValueError("The PR file list is incomplete or changed during detection. Retry the workflow.")
+              if api(f"pulls/{number}")["head"]["sha"] != pull["head"]["sha"]:
+                  raise ValueError("The PR changed during detection. Run the workflow for the latest PR commit.")
+
+              filenames = [item["filename"] for item in files if item["status"] != "removed"]
+              languages = {file_language(filename) for filename in filenames} - {None}
+              has_kotlin = any(PurePosixPath(filename).suffix.lower() in {".kt", ".kts"} for filename in filenames)
+              if "java-kotlin" in languages and not has_kotlin:
+                  # A Java-only change must not disable analysis of existing Kotlin.
+                  has_kotlin = "Kotlin" in api("languages")
+              return matrix_for(languages, has_kotlin)
+
+          def main():
+              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+                  event = json.load(event_file)
+              matrix = detect(os.environ["DETECTION_MODE"], event)
+              encoded = json.dumps(matrix, separators=(",", ":"))
+              has_languages = bool(matrix["include"])
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write(f"matrix={encoded}\n")
+                  output.write(f"has-languages={str(has_languages).lower()}\n")
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write(f"Detection mode: `{os.environ['DETECTION_MODE']}`\n\n")
+                  summary.write(f"Selected CodeQL matrix:\n\n```json\n{encoded}\n```\n")
+                  if not has_languages:
+                      summary.write("\nNo supported source languages were selected; analysis will be skipped.\n")
+
+          if __name__ == "__main__":
+              main()
+          PY
