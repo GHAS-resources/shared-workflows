@@ -239,6 +239,7 @@ class ScanTests(unittest.TestCase):
             "GH_TOKEN": "test-token",
             "GITHUB_STEP_SUMMARY": str(self.root / "summary"),
             "GITHUB_PATH": str(self.root / "github-path"),
+            "SEVERITY_RESULT": "success",
         }
         self.stub("codeql", """#!/usr/bin/env python3
 import json, os, sys
@@ -330,6 +331,12 @@ sys.exit(int(os.environ.get("CLI_EXIT", "0")))
             with self.subTest(detection=detection, analysis=analysis, selected=selected):
                 result = self.step("Report analysis outcome", DETECTION_RESULT=detection, ANALYSIS_RESULT=analysis, HAS_LANGUAGES=selected)
                 self.assertEqual(result.returncode, expected, result.stderr)
+        for gate in ("failure", "cancelled", "skipped"):
+            result = self.step(
+                "Report analysis outcome", DETECTION_RESULT="success",
+                ANALYSIS_RESULT="success", HAS_LANGUAGES="true", SEVERITY_RESULT=gate,
+            )
+            self.assertEqual(result.returncode, 1)
 
     def test_install_rejects_invalid_release_tags(self):
         result = self.step("Install CodeQL CLI and bundled queries", CODEQL_VERSION="v2; echo injected", RUNNER_OS="Linux")
@@ -375,6 +382,211 @@ else:
         )
         self.assertNotEqual(failed.returncode, 0)
         self.assertNotIn("CodeQL test CLI", failed.stdout)
+
+
+class SeverityTests(unittest.TestCase):
+    def setUp(self):
+        source = run_block("codeql-cli.yml", "Enforce security severity threshold")
+        source = source.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        self.code = {"__name__": "severity_test"}
+        exec(compile(source, "severity-gate", "exec"), self.code)
+        self.environment = patch.dict(os.environ, {
+            "GITHUB_REF": "refs/pull/42/merge", "GITHUB_SHA": "merge",
+            "GITHUB_API_URL": "https://api.github.com", "GITHUB_REPOSITORY": "owner/repo",
+            "GH_TOKEN": "token",
+        })
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        self.matrix = {"include": [{"language": "python"}]}
+        self.event = {"pull_request": {"base": {"ref": "main", "sha": "base"}}}
+        self.category = "codeql-cli/python/"
+        self.current = "refs/pull/42/merge"
+        self.base = "refs/heads/main"
+        self.data = {}
+        self.calls = []
+        self.set_analysis(self.current, "merge", 2)
+        self.set_analysis(self.base, "base", 1)
+
+        def api(path, **parameters):
+            self.calls.append((path, parameters))
+            items = self.data.get((path, parameters["ref"]), [])
+            offset = (parameters["page"] - 1) * 100
+            return items[offset:offset + 100]
+
+        self.code["api"] = api
+
+    def set_analysis(self, ref, sha, identifier, error=""):
+        self.data[("code-scanning/analyses", ref)] = [{
+            "id": identifier, "category": self.category, "commit_sha": sha, "error": error,
+        }]
+
+    def add_alert(self, number, severity, ref=None, sha="merge", category=None, state="open", dismissed=False):
+        ref = ref or self.current
+        self.data.setdefault(("code-scanning/alerts", ref), []).append({
+            "number": number, "rule": {"security_severity_level": severity},
+            "state": "dismissed" if dismissed else "open",
+        })
+        self.data.setdefault((f"code-scanning/alerts/{number}/instances", ref), []).append({
+            "category": category or self.category, "commit_sha": sha, "state": state,
+        })
+
+    def evaluate(self, threshold="high", scope="new", event=None, matrix=None):
+        return self.code["evaluate"](
+            threshold, scope, self.matrix if matrix is None else matrix,
+            self.event if event is None else event,
+        )
+
+    def test_inclusive_threshold_boundaries(self):
+        levels = ["low", "medium", "high", "critical"]
+        for threshold_index, threshold in enumerate(levels):
+            for severity_index, severity in enumerate(levels):
+                with self.subTest(threshold=threshold, severity=severity):
+                    self.data[("code-scanning/alerts", self.current)] = []
+                    self.add_alert(1, severity)
+                    message, blocked = self.evaluate(threshold, "all")
+                    self.assertEqual(blocked, severity_index >= threshold_index)
+                    self.assertIn(f"threshold={threshold} (inclusive)", message)
+
+    def test_default_new_excludes_baseline_and_all_includes_it(self):
+        self.add_alert(1, "critical")
+        self.add_alert(1, "critical", ref=self.base, sha="base")
+        self.assertFalse(self.evaluate()[1])
+        self.assertTrue(self.evaluate(scope="all")[1])
+        self.add_alert(2, "high")
+        self.assertTrue(self.evaluate()[1])
+
+    def test_existing_lower_severity_is_still_existing(self):
+        self.add_alert(1, "high")
+        self.add_alert(1, "low", ref=self.base, sha="base")
+        self.assertFalse(self.evaluate()[1])
+
+    def test_fixed_on_base_is_reintroduced(self):
+        self.add_alert(1, "high")
+        self.add_alert(1, "high", ref=self.base, sha="base", state="fixed")
+        self.assertTrue(self.evaluate()[1])
+
+    def test_dismissed_fixed_other_category_and_stale_instances_do_not_block(self):
+        self.add_alert(1, "critical", dismissed=True)
+        self.add_alert(2, "critical", state="fixed")
+        self.add_alert(3, "critical", category="some-other-scan/")
+        self.add_alert(4, "critical", sha="old")
+        self.add_alert(5, None)
+        self.assertFalse(self.evaluate()[1])
+
+    def test_uses_all_instances_not_most_recent(self):
+        self.add_alert(1, "high", category="unrelated/")
+        self.data[("code-scanning/alerts/1/instances", self.current)].append({
+            "category": self.category, "commit_sha": "merge", "state": "open",
+        })
+        self.assertTrue(self.evaluate()[1])
+
+    def test_missing_stale_failed_and_wrong_category_baselines_fail(self):
+        for records in (
+            [],
+            [{"id": 1, "category": self.category, "commit_sha": "old", "error": ""}],
+            [{"id": 1, "category": self.category, "commit_sha": "base", "error": "failed"}],
+            [{"id": 1, "category": "wrong/", "commit_sha": "base", "error": ""}],
+        ):
+            with self.subTest(records=records):
+                self.data[("code-scanning/analyses", self.base)] = records
+                with self.assertRaises(ValueError):
+                    self.evaluate()
+
+    def test_latest_analysis_must_match_expected_commit(self):
+        self.data[("code-scanning/analyses", self.current)].append({
+            "id": 3, "category": self.category, "commit_sha": "new-merge", "error": "",
+        })
+        with self.assertRaisesRegex(ValueError, "stale"):
+            self.evaluate()
+
+    def test_merge_group_and_branch_behavior(self):
+        self.add_alert(1, "high")
+        self.add_alert(1, "high", ref=self.base, sha="base")
+        event = {"merge_group": {"base_ref": self.base, "base_sha": "base"}}
+        self.assertFalse(self.evaluate(event=event)[1])
+        message, blocked = self.evaluate(event={})
+        self.assertTrue(blocked)
+        self.assertIn("scope=all", message)
+
+    def test_disabled_empty_and_invalid_options(self):
+        self.assertFalse(self.evaluate(threshold="none")[1])
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.evaluate(matrix={"include": []})[1])
+        self.assertEqual(self.calls, [])
+        for threshold, scope in (("typo", "new"), ("none", "typo"), ("high", "typo")):
+            with self.subTest(threshold=threshold, scope=scope):
+                with self.assertRaises(ValueError):
+                    self.evaluate(threshold, scope)
+
+    def test_paginates_alerts_instances_and_analyses(self):
+        self.data[("code-scanning/analyses", self.current)] = [
+            {"id": 10 + index, "category": "other/", "commit_sha": "merge", "error": ""}
+            for index in range(100)
+        ] + [{"id": 2, "category": self.category, "commit_sha": "merge", "error": ""}]
+        for number in range(101):
+            self.add_alert(number, "high", category="other/")
+        self.data[("code-scanning/alerts/100/instances", self.current)] = [
+            {"category": "other/", "commit_sha": "merge", "state": "open"}
+            for _ in range(100)
+        ] + [{"category": self.category, "commit_sha": "merge", "state": "open"}]
+        self.assertTrue(self.evaluate()[1])
+        for path in ("code-scanning/alerts", "code-scanning/analyses", "code-scanning/alerts/100/instances"):
+            self.assertTrue(any(p == path and args["page"] == 2 for p, args in self.calls))
+
+    def test_api_errors_and_unknown_severity_fail(self):
+        self.add_alert(1, "unknown")
+        with self.assertRaisesRegex(ValueError, "Unknown security severity"):
+            self.evaluate()
+
+        def forbidden(path, **parameters):
+            raise HTTPError("test", 403, "Forbidden", {}, None)
+
+        self.code["api"] = forbidden
+        with self.assertRaises(HTTPError):
+            self.evaluate()
+
+    def test_changing_analysis_during_evaluation_fails(self):
+        original = self.code["api"]
+        calls = 0
+
+        def api(path, **parameters):
+            nonlocal calls
+            if path == "code-scanning/analyses" and parameters["ref"] == self.current:
+                calls += 1
+                if calls > 1:
+                    self.set_analysis(self.current, "merge", 3)
+            return original(path, **parameters)
+
+        self.code["api"] = api
+        with self.assertRaisesRegex(ValueError, "changed during"):
+            self.evaluate()
+
+    def test_multi_language_violation_is_not_hidden_by_clean_language(self):
+        matrix = {"include": [{"language": "python"}, {"language": "javascript-typescript"}]}
+        for ref, sha in ((self.current, "merge"), (self.base, "base")):
+            self.data[("code-scanning/analyses", ref)].append({
+                "id": 3, "category": "codeql-cli/javascript-typescript/", "commit_sha": sha, "error": "",
+            })
+        self.add_alert(1, "critical", category="codeql-cli/javascript-typescript/")
+        message, blocked = self.evaluate(matrix=matrix)
+        self.assertTrue(blocked)
+        self.assertIn("Blocking findings: 1", message)
+
+    def test_main_writes_summary_and_fails_for_violations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "event").write_text(json.dumps(self.event))
+            with patch.dict(os.environ, {
+                "GITHUB_EVENT_PATH": str(root / "event"),
+                "GITHUB_STEP_SUMMARY": str(root / "summary"),
+                "FAIL_ON_SEVERITY": "high", "FINDINGS_SCOPE": "new",
+                "LANGUAGE_MATRIX": json.dumps(self.matrix),
+            }):
+                self.add_alert(1, "critical")
+                with self.assertRaises(SystemExit) as exited:
+                    self.code["main"]()
+                self.assertEqual(exited.exception.code, 1)
+                self.assertIn("critical=1", (root / "summary").read_text())
 
 
 if __name__ == "__main__":

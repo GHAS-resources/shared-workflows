@@ -49,6 +49,66 @@ is triggered by `workflow_call`, not directly by pull requests.
 | `detection-mode` | `automatic` | Select all supported repository languages, or use `computed` for PR file extensions. |
 | `codeql-version` | `latest` | Official bundle release tag, for example `codeql-bundle-v2.27.4`. Pin a supported release for reproducibility. |
 | `config-file` | Empty | Optional repository-local CodeQL configuration file for queries, packs, filters, and supported path exclusions. With no file, run each language pack's default code-scanning suite. |
+| `fail-on-severity` | `none` | Optional security gate: `low`, `medium`, `high`, or `critical`, inclusive of higher severities. `none` keeps upload-only behavior. |
+| `findings-scope` | `new` | `new` blocks newly introduced findings relative to the PR/merge-group base; `all` also blocks existing findings. Branch events evaluate all findings. |
+
+### Block merges on security findings
+
+The CLI normally exits successfully even when it finds vulnerabilities. Enable
+the severity gate in the caller's `with` block:
+
+```yaml
+with:
+  detection-mode: automatic
+  fail-on-severity: high
+  findings-scope: new
+```
+
+This fails **CodeQL severity gate** and the final **CodeQL CLI result** when
+new **high or critical** security findings are present. Set `findings-scope: all`
+to include existing vulnerabilities. Severities are inclusive:
+`low` includes low/medium/high/critical, `medium` includes medium/high/critical,
+and `critical` includes only critical. Non-security code-quality findings have
+no security severity and are not counted. Dismissed alerts and fixed instances
+are excluded.
+
+The workflow must be enforced by an **Active required-workflow ruleset** as
+described below, or its final check must be a required status check in branch
+protection/a ruleset. Without such enforcement, a failed workflow does **not**
+prevent merging. This input does not create or modify repository rules.
+
+The gate runs in a separate, read-only job without checking out or executing
+target-repository code. It reads processed GitHub code scanning results after
+the CLI upload completes, checks each selected `codeql-cli/<language>/`
+category at the scanned SHA, and paginates analyses, alerts, and alert instances.
+It counts only open instances of that category/commit, not unrelated scans.
+API/permission errors, failed or stale analyses, and concurrent analysis
+changes fail the gate rather than being treated as zero findings.
+
+**Baseline requirement for `new`:** On PR and merge-group events, every selected
+language needs a successful base-branch analysis at the event's exact base SHA,
+with the same category. Maintain a separate caller using this reusable workflow
+on `push` to every protected base branch (the caller example above includes
+`push` to `main`). Run it once before enabling the gate; an initial
+`workflow_dispatch` trigger on that caller can bootstrap the current branch.
+Use equivalent query configuration and preferably the same pinned CodeQL
+version for comparable results. A different tool/category is not a substitute.
+Missing or outdated baselines fail explicitly, including for a newly selected
+language without a base analysis; establish a valid baseline or choose `all`
+if baseline-independent enforcement is required.
+
+Newness uses GitHub's alert identity: an alert present in the base category at
+the base SHA is existing, even if its severity changes; a previously fixed alert
+reintroduced on the PR is new. For `push`, `workflow_dispatch`, and other events
+without a PR/merge-group base, `new` evaluates **all** current findings so branch
+scans can establish baselines. Upload happens before gating, so results remain
+available even when vulnerabilities cause failure.
+
+Scope is limited to the languages selected for this run. Computed detection can
+skip languages or select none; no selected languages remains an explicit skip,
+not proof that the repository is vulnerability-free. Use `automatic` for broader
+coverage. This option applies only to `codeql-cli.yml`, not the centralized PR
+scanner.
 
 ### Set up an organization required workflow
 
@@ -110,6 +170,8 @@ jobs:
     with:
       detection-mode: automatic
       codeql-version: latest
+      fail-on-severity: high
+      findings-scope: new
 ```
 
 The explicit job condition supports using a source workflow for ruleset runs
@@ -121,11 +183,13 @@ required-workflow rule; maintain default-branch scans separately for baselines.
 Ruleset runs ignore event filters such as `paths`, `branches`, and `types`.
 Do not add `cancel-in-progress` concurrency to the required workflow.
 
-This rule requires successful workflow execution, **not zero CodeQL findings**.
-The CLI scan can pass while uploading alerts, and this implementation also
-passes with an explicit skip when no supported languages are selected. To
-enforce alert-severity thresholds, configure **Require code scanning results**
-for CodeQL separately and maintain suitable base/default-branch analyses.
+With `fail-on-severity: high`, this example requires both successful execution
+and no newly introduced high/critical findings. Establish and maintain the
+base-branch analyses described above before enabling it. With the default
+`fail-on-severity: none`, workflow success does **not** imply zero findings.
+No supported languages still produces an explicit skip. GitHub's native
+**Require code scanning results** rule is an alternative way to enforce alert
+thresholds independently of this workflow input.
 The CLI approach avoids the prohibited CodeQL actions in ruleset workflows;
 it does not bypass licensing, runner, token, or other policy restrictions.
 The centralized scanner below is not a substitute for this required workflow.
@@ -168,7 +232,8 @@ with:
 ```
 
 An empty matrix skips analysis and reports the skip explicitly. The final
-`CodeQL CLI result` job fails if detection, analysis, or upload fails.
+`CodeQL CLI result` job fails if detection, analysis, upload, or the severity
+gate fails.
 
 ### Build modes and runners
 
@@ -218,9 +283,9 @@ References: [CodeQL build modes](https://docs.github.com/en/code-security/how-to
 python3 -m unittest discover -s tests -v
 ```
 
-The tests execute the embedded language-detection code with mocked GitHub API
-responses and exercise the scan shell steps with a stub CLI, without downloading
-the multi-gigabyte bundle or uploading results.
+The tests execute the embedded language-detection and severity-gate code with
+mocked GitHub API responses and exercise the scan shell steps with a stub CLI,
+without downloading the multi-gigabyte bundle or uploading results.
 
 ## Centralized organization PR CodeQL scanning
 
