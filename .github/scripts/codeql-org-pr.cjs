@@ -130,8 +130,12 @@ function languageMatrix(paths) {
     }
     if (extension === '.kt' || extension === '.kts') kotlin = true;
   }
+  return matrixFor(found, kotlin);
+}
+
+function matrixFor(languages, kotlin) {
   return {
-    include: [...found].sort().map((language) => ({
+    include: [...languages].sort().map((language) => ({
       language,
       build_mode: language === 'go' || language === 'swift' ||
         (language === 'java-kotlin' && kotlin) ? 'autobuild' : 'none',
@@ -229,4 +233,4 @@ async function upload({ github, core, env, pause = sleep }) {
   if (failures.length) throw new Error(`Upload incomplete:\n${failures.join('\n')}`);
 }
 
-module.exports = { validateTarget, eligible, dispatch, treePaths, languageMatrix, prepare, upload };
+module.exports = { validateTarget, eligible, dispatch, treePaths, languageMatrix, matrixFor, prepare, upload };

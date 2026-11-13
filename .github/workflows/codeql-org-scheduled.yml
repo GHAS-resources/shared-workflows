@@ -1,0 +1,75 @@
+name: Scheduled organization CodeQL scans
+
+on:
+  schedule:
+    # A static heartbeat; CODEQL_INTERVAL_MINUTES below controls discovery cadence.
+    - cron: '2/5 * * * *'
+  workflow_dispatch:
+
+# These are central-repository Actions variables. Empty variables use these defaults.
+# The worker reads the same variables, never caller-supplied export destinations.
+env:
+  CODEQL_ORG: ${{ vars.CODEQL_ORG || github.repository_owner }}
+  CODEQL_INTERVAL_MINUTES: ${{ vars.CODEQL_INTERVAL_MINUTES || '60' }}
+  CODEQL_CUSTOM_PROPERTY: ${{ vars.CODEQL_CUSTOM_PROPERTY }}
+  CODEQL_BRANCHES: ${{ vars.CODEQL_BRANCHES || 'default' }}
+  CODEQL_CHANGES_ONLY: ${{ vars.CODEQL_CHANGES_ONLY || 'true' }}
+  CODEQL_DETECTION_MODE: ${{ vars.CODEQL_DETECTION_MODE || 'automatic' }}
+  CODEQL_DESTINATION: ${{ vars.CODEQL_DESTINATION || 'github' }}
+  CODEQL_EXPORT_FORMAT: ${{ vars.CODEQL_EXPORT_FORMAT || 'sarif' }}
+  CODEQL_EXPORT_ENDPOINT: ${{ vars.CODEQL_EXPORT_ENDPOINT }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-org-scheduled
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate configuration
+        uses: actions/github-script@v8
+        with:
+          script: require('./.github/scripts/codeql-org-scheduled.cjs').configuration(process.env);
+      - name: Create organization discovery token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.CODEQL_APP_ID }}
+          private-key: ${{ secrets.CODEQL_APP_PRIVATE_KEY }}
+          owner: ${{ env.CODEQL_ORG }}
+          permission-contents: read
+      - name: Discover and dispatch branch scans
+        id: discover
+        uses: actions/github-script@v8
+        env:
+          DISPATCH_TOKEN: ${{ github.token }}
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          script: |
+            const { configuration, dispatch } = require('./.github/scripts/codeql-org-scheduled.cjs');
+            const dispatcher = new github.constructor({
+              auth: process.env.DISPATCH_TOKEN, baseUrl: process.env.GITHUB_API_URL
+            });
+            await dispatch({ github, dispatcher, context, core, config: configuration(process.env) });
+      - name: Write polling marker
+        if: steps.discover.outputs.polled == 'true'
+        run: printf '{}\n' > "$RUNNER_TEMP/poll.json"
+      - name: Persist successful discovery time
+        if: steps.discover.outputs.polled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.discover.outputs.poll_name }}
+          path: ${{ runner.temp }}/poll.json
+          retention-days: 90
+          if-no-files-found: error
