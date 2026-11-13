@@ -1,0 +1,218 @@
+name: Centralized branch CodeQL scan
+run-name: CodeQL ${{ inputs.repository }} branch ${{ inputs.branch }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Target repository (owner/name)
+        required: true
+        type: string
+      branch:
+        description: Short branch name (not refs/heads/...)
+        required: true
+        type: string
+
+env:
+  CODEQL_ORG: ${{ vars.CODEQL_ORG || github.repository_owner }}
+  CODEQL_INTERVAL_MINUTES: ${{ vars.CODEQL_INTERVAL_MINUTES || '60' }}
+  CODEQL_CUSTOM_PROPERTY: ${{ vars.CODEQL_CUSTOM_PROPERTY }}
+  CODEQL_BRANCHES: ${{ vars.CODEQL_BRANCHES || 'default' }}
+  CODEQL_CHANGES_ONLY: ${{ vars.CODEQL_CHANGES_ONLY || 'true' }}
+  CODEQL_DETECTION_MODE: ${{ vars.CODEQL_DETECTION_MODE || 'automatic' }}
+  CODEQL_DESTINATION: ${{ vars.CODEQL_DESTINATION || 'github' }}
+  CODEQL_EXPORT_FORMAT: ${{ vars.CODEQL_EXPORT_FORMAT || 'sarif' }}
+  CODEQL_EXPORT_ENDPOINT: ${{ vars.CODEQL_EXPORT_ENDPOINT }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-branch-${{ inputs.repository }}-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      scan: ${{ steps.prepare.outputs.scan }}
+      owner: ${{ steps.scope.outputs.owner }}
+      repo: ${{ steps.scope.outputs.repo }}
+      repository: ${{ steps.prepare.outputs.repository }}
+      branch: ${{ steps.prepare.outputs.branch }}
+      sha: ${{ steps.prepare.outputs.sha }}
+      matrix: ${{ steps.prepare.outputs.matrix }}
+      checkpoint: ${{ steps.prepare.outputs.checkpoint }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate scope and configuration
+        id: scope
+        uses: actions/github-script@v8
+        env:
+          TARGET_REPOSITORY: ${{ inputs.repository }}
+        with:
+          script: |
+            const { configuration } = require('./.github/scripts/codeql-org-scheduled.cjs');
+            const { validateTarget } = require('./.github/scripts/codeql-org-pr.cjs');
+            const target = validateTarget(process.env.TARGET_REPOSITORY, '1', configuration(process.env).org);
+            core.setOutput('owner', target.owner);
+            core.setOutput('repo', target.repo);
+      - name: Create read-only source token
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.CODEQL_APP_ID }}
+          private-key: ${{ secrets.CODEQL_APP_PRIVATE_KEY }}
+          owner: ${{ steps.scope.outputs.owner }}
+          repositories: ${{ steps.scope.outputs.repo }}
+          permission-contents: read
+      - name: Resolve branch snapshot and languages
+        id: prepare
+        uses: actions/github-script@v8
+        env:
+          TARGET_REPOSITORY: ${{ inputs.repository }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+          CONTROLLER_TOKEN: ${{ github.token }}
+        with:
+          github-token: ${{ steps.app.outputs.token }}
+          script: |
+            const { configuration, prepare } = require('./.github/scripts/codeql-org-scheduled.cjs');
+            const controller = new github.constructor({
+              auth: process.env.CONTROLLER_TOKEN, baseUrl: process.env.GITHUB_API_URL
+            });
+            await prepare({ github, controller, context, core, config: configuration(process.env),
+              repository: process.env.TARGET_REPOSITORY, branch: process.env.TARGET_BRANCH });
+      - name: Check out immutable branch snapshot
+        if: steps.prepare.outputs.scan == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.prepare.outputs.repository }}
+          ref: ${{ steps.prepare.outputs.sha }}
+          token: ${{ steps.app.outputs.token }}
+          path: source
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - name: Package source snapshot
+        if: steps.prepare.outputs.scan == 'true'
+        run: tar -czf "$RUNNER_TEMP/source.tgz" -C source .
+      - name: Store source for isolated scanning
+        if: steps.prepare.outputs.scan == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-source
+          path: ${{ runner.temp }}/source.tgz
+          retention-days: 1
+          if-no-files-found: error
+
+  scan:
+    needs: prepare
+    if: needs.prepare.outputs.scan == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      # No target token, App key, or export credential enters the build job.
+      - uses: actions/download-artifact@v4
+        with:
+          name: codeql-source
+          path: ${{ runner.temp }}/snapshot
+      - name: Restore source snapshot
+        run: |
+          mkdir source
+          tar -xzf "$RUNNER_TEMP/snapshot/source.tgz" -C source
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build_mode }}
+          source-root: source
+          config: |
+            name: Centralized branch analysis
+            queries:
+              - uses: security-extended
+          dependency-caching: false
+      - name: Autobuild compiled language
+        if: matrix.build_mode == 'autobuild'
+        uses: github/codeql-action/autobuild@v4
+        with:
+          working-directory: source
+      - name: Analyze without central repository upload
+        uses: github/codeql-action/analyze@v4
+        with:
+          checkout_path: source
+          output: ${{ runner.temp }}/sarif
+          # Match the PR scanner so default-branch results can serve as its baseline.
+          category: centralized-pr-codeql/${{ matrix.language }}
+          upload: never
+          upload-database: false
+      - name: Record source URI
+        run: printf 'file://%s/source/\n' "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/sarif/checkout-uri.txt"
+      - name: Store language results
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-${{ matrix.language }}
+          path: |
+            ${{ runner.temp }}/sarif/*.sarif
+            ${{ runner.temp }}/sarif/checkout-uri.txt
+          retention-days: 1
+          if-no-files-found: error
+
+  deliver:
+    needs: [prepare, scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sarif-*
+          path: ${{ runner.temp }}/sarif
+      - name: Create target upload token
+        if: env.CODEQL_DESTINATION == 'github'
+        id: app
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.CODEQL_APP_ID }}
+          private-key: ${{ secrets.CODEQL_APP_PRIVATE_KEY }}
+          owner: ${{ needs.prepare.outputs.owner }}
+          repositories: ${{ needs.prepare.outputs.repo }}
+          permission-contents: read
+          permission-security-events: write
+      - name: Deliver all language results
+        uses: actions/github-script@v8
+        env:
+          TARGET_REPOSITORY: ${{ needs.prepare.outputs.repository }}
+          TARGET_BRANCH: ${{ needs.prepare.outputs.branch }}
+          TARGET_SHA: ${{ needs.prepare.outputs.sha }}
+          LANGUAGE_MATRIX: ${{ needs.prepare.outputs.matrix }}
+          SARIF_DIRECTORY: ${{ runner.temp }}/sarif
+          EXPORT_TOKEN: ${{ secrets.CODEQL_EXPORT_TOKEN }}
+        with:
+          github-token: ${{ steps.app.outputs.token || github.token }}
+          script: |
+            const { configuration, deliver } = require('./.github/scripts/codeql-org-scheduled.cjs');
+            await deliver({ github, core, env: process.env, config: configuration(process.env) });
+      - name: Write successful delivery checkpoint
+        run: printf '{}\n' > "$RUNNER_TEMP/checkpoint.json"
+      - name: Persist successful branch SHA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.prepare.outputs.checkpoint }}
+          path: ${{ runner.temp }}/checkpoint.json
+          retention-days: 90
+          if-no-files-found: error
