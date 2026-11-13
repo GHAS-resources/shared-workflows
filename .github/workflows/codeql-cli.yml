@@ -15,6 +15,14 @@ on:
         description: Optional CodeQL configuration file relative to the caller's repository root.
         type: string
         default: ""
+      fail-on-severity:
+        description: "Fail on security findings at or above low, medium, high, or critical; none disables the gate."
+        type: string
+        default: none
+      findings-scope:
+        description: "'new' compares PR/merge-group findings with the base analysis; 'all' includes existing findings."
+        type: string
+        default: new
 
 permissions:
   contents: read
@@ -153,9 +161,148 @@ jobs:
             --github-url="$GITHUB_SERVER_URL" \
             --github-auth-stdin
 
+  severity:
+    name: CodeQL severity gate
+    needs: [detect, analyze]
+    if: ${{ always() && needs.detect.result == 'success' && (needs.analyze.result == 'success' || needs.analyze.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: read
+    steps:
+      - name: Enforce security severity threshold
+        env:
+          FAIL_ON_SEVERITY: ${{ inputs.fail-on-severity }}
+          FINDINGS_SCOPE: ${{ inputs.findings-scope }}
+          LANGUAGE_MATRIX: ${{ needs.detect.outputs.matrix }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+
+          LEVELS = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+          def api(path, **parameters):
+              url = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/{path}"
+              if parameters:
+                  url += "?" + urlencode(parameters)
+              request = Request(url, headers={
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urlopen(request, timeout=60) as response:
+                  return json.load(response)
+
+          def pages(path, **parameters):
+              items = []
+              page = 1
+              while True:
+                  batch = api(path, per_page=100, page=page, **parameters)
+                  items.extend(batch)
+                  if len(batch) < 100:
+                      return items
+                  page += 1
+
+          def analysis(ref, sha, category):
+              matches = [
+                  item for item in pages("code-scanning/analyses", ref=ref, tool_name="CodeQL")
+                  if item["category"] == category
+              ]
+              if not matches:
+                  raise ValueError(f"No {category} baseline/analysis for {ref}. Run this workflow on the base branch first.")
+              latest = max(matches, key=lambda item: item["id"])
+              if latest["commit_sha"] != sha or latest.get("error"):
+                  raise ValueError(f"Missing, stale, or failed {category} analysis for {ref} at {sha}. Rerun its scan.")
+              return latest["id"]
+
+          def findings(ref, sha, category, threshold, baseline=False):
+              found = {}
+              for alert in pages("code-scanning/alerts", ref=ref, tool_name="CodeQL"):
+                  if not baseline and alert["state"] == "dismissed":
+                      continue
+                  severity = alert["rule"].get("security_severity_level")
+                  if severity is None:
+                      continue  # Non-security code-quality findings have no security severity.
+                  if severity not in LEVELS:
+                      raise ValueError(f"Unknown security severity for alert {alert['number']}: {severity}")
+                  if not baseline and LEVELS[severity] < LEVELS[threshold]:
+                      continue
+                  # An alert can have instances in multiple categories; do not rely on most_recent_instance.
+                  instances = pages(f"code-scanning/alerts/{alert['number']}/instances", ref=ref)
+                  if any(
+                      instance["category"] == category and instance["commit_sha"] == sha
+                      and instance["state"] == "open"
+                      for instance in instances
+                  ):
+                      found[alert["number"]] = severity
+              return found
+
+          def evaluate(threshold, scope, matrix, event):
+              if threshold not in {*LEVELS, "none"}:
+                  raise ValueError("fail-on-severity must be none, low, medium, high, or critical.")
+              if scope not in {"new", "all"}:
+                  raise ValueError("findings-scope must be new or all.")
+              if threshold == "none":
+                  return "Security severity gate disabled (fail-on-severity: none).", False
+              if not matrix["include"]:
+                  return "No supported languages selected; no findings were evaluated.", False
+              base = None
+              if scope == "new":
+                  if "pull_request" in event:
+                      base = (f"refs/heads/{event['pull_request']['base']['ref']}", event["pull_request"]["base"]["sha"])
+                  elif "merge_group" in event:
+                      base = (event["merge_group"]["base_ref"], event["merge_group"]["base_sha"])
+                  # Branch scans bootstrap the baseline and gate all current findings.
+              effective_scope = "new" if base else "all"
+              ref, sha = os.environ["GITHUB_REF"], os.environ["GITHUB_SHA"]
+              snapshots = []
+              violations = {}
+              for entry in matrix["include"]:
+                  category = f"codeql-cli/{entry['language']}/"
+                  snapshots.append((ref, sha, category, analysis(ref, sha, category)))
+                  current = findings(ref, sha, category, threshold)
+                  if base:
+                      base_ref, base_sha = base
+                      snapshots.append((base_ref, base_sha, category, analysis(base_ref, base_sha, category)))
+                      existing = findings(base_ref, base_sha, category, threshold, baseline=True)
+                      current = {number: severity for number, severity in current.items() if number not in existing}
+                  violations.update(current)
+              for snapshot_ref, snapshot_sha, category, identifier in snapshots:
+                  if analysis(snapshot_ref, snapshot_sha, category) != identifier:
+                      raise ValueError("An analysis changed during severity evaluation; rerun the workflow.")
+              counts = {level: list(violations.values()).count(level) for level in LEVELS}
+              message = (
+                  f"Security severity gate: scope={effective_scope}, threshold={threshold} (inclusive). "
+                  f"Blocking findings: {len(violations)}; "
+                  + ", ".join(f"{level}={count}" for level, count in counts.items())
+                  + "."
+              )
+              return message, bool(violations)
+
+          def main():
+              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+                  event = json.load(event_file)
+              message, blocked = evaluate(
+                  os.environ["FAIL_ON_SEVERITY"], os.environ["FINDINGS_SCOPE"],
+                  json.loads(os.environ["LANGUAGE_MATRIX"]), event,
+              )
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write(message + "\n")
+              print(("::error::" if blocked else "") + message)
+              if blocked:
+                  raise SystemExit(1)
+
+          if __name__ == "__main__":
+              main()
+          PY
+
   result:
     name: CodeQL CLI result
-    needs: [detect, analyze]
+    needs: [detect, analyze, severity]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     permissions: {}
@@ -165,11 +312,16 @@ jobs:
           DETECTION_RESULT: ${{ needs.detect.result }}
           ANALYSIS_RESULT: ${{ needs.analyze.result }}
           HAS_LANGUAGES: ${{ needs.detect.outputs.has-languages }}
+          SEVERITY_RESULT: ${{ needs.severity.result }}
         shell: bash
         run: |
           set -euo pipefail
           if [[ "$DETECTION_RESULT" != success ]]; then
             echo "::error::Language detection did not succeed."
+            exit 1
+          fi
+          if [[ "$SEVERITY_RESULT" != success ]]; then
+            echo "::error::Security severity evaluation did not succeed: $SEVERITY_RESULT"
             exit 1
           fi
           if [[ "$ANALYSIS_RESULT" == success ]]; then
